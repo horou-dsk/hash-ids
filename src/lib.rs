@@ -11,7 +11,7 @@ fn main() {
         .with_salt("Arbitrary string")
         .finish();
     assert_eq!("neHrCa", hash_ids.encode(&[1, 2, 3]));
-    assert_eq!(vec![1, 2, 3], hash_ids.decode("neHrCa"));
+    assert_eq!(Ok(vec![1, 2, 3]), hash_ids.decode("neHrCa"));
 }
 ```
 */
@@ -25,10 +25,11 @@ const DEFAULT_SEPARATORS: &str = "cfhistuCFHISTU";
 const DEFAULT_ALPHABET: &str = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890";
 
 /// Error container, for custom alphabets that won't work
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub enum Error {
     AlphabetTooSmall,
     ContainsSpace,
+    DecodeFailed,
 }
 
 impl std::fmt::Display for Error {
@@ -36,6 +37,7 @@ impl std::fmt::Display for Error {
         match self {
             Error::AlphabetTooSmall => "Alphabet must contain at least 16 unique characters".fmt(f),
             Error::ContainsSpace => "Alphabet may not contain spaces".fmt(f),
+            Error::DecodeFailed => "Decode Failed".fmt(f),
         }
     }
 }
@@ -51,7 +53,10 @@ pub struct HashIdsBuilder {
 
 impl HashIdsBuilder {
     fn new() -> Self {
-        Self { salt: vec![], min_length: 0 }
+        Self {
+            salt: vec![],
+            min_length: 0,
+        }
     }
 }
 
@@ -79,12 +84,20 @@ impl HashIdsBuilderWithCustomAlphabet {
     ///
     /// Can fail if the custom alphabet won't work
     pub fn finish(self) -> std::result::Result<HashIds, Error> {
-        let Self { inner: HashIdsBuilder { salt, min_length }, mut alphabet } = self;
+        let Self {
+            inner: HashIdsBuilder { salt, min_length },
+            mut alphabet,
+        } = self;
 
-        let separators =
-            DEFAULT_SEPARATORS.chars().filter(|x| alphabet.contains(x)).collect::<Vec<_>>();
+        let separators = DEFAULT_SEPARATORS
+            .chars()
+            .filter(|x| alphabet.contains(x))
+            .collect::<Vec<_>>();
 
-        alphabet = alphabet.drain(..).filter(|x| !separators.contains(x)).collect();
+        alphabet = alphabet
+            .drain(..)
+            .filter(|x| !separators.contains(x))
+            .collect();
 
         alphabet = alphabet
             .clone()
@@ -102,7 +115,14 @@ impl HashIdsBuilderWithCustomAlphabet {
             return Err(Error::ContainsSpace);
         }
 
-        Ok(HashIds { salt, min_length, alphabet, separators, guards: Vec::new() }.finish())
+        Ok(HashIds {
+            salt,
+            min_length,
+            alphabet,
+            separators,
+            guards: Vec::new(),
+        }
+        .finish())
     }
 }
 
@@ -121,7 +141,10 @@ impl HashIdsBuilder {
 
     /// Set the custom alphabet to use for encoding
     pub fn with_alphabet(self, alphabet: &str) -> HashIdsBuilderWithCustomAlphabet {
-        HashIdsBuilderWithCustomAlphabet { inner: self, alphabet: alphabet.chars().collect() }
+        HashIdsBuilderWithCustomAlphabet {
+            inner: self,
+            alphabet: alphabet.chars().collect(),
+        }
     }
 
     /// Convert the builder to the finished `HashIds`
@@ -158,7 +181,13 @@ impl HashIds {
     }
 
     fn finish(self) -> Self {
-        let Self { salt, min_length, mut alphabet, mut separators, .. } = self;
+        let Self {
+            salt,
+            min_length,
+            mut alphabet,
+            mut separators,
+            ..
+        } = self;
 
         let mut guards;
 
@@ -186,7 +215,13 @@ impl HashIds {
             std::mem::swap(&mut alphabet, &mut guards);
         }
 
-        Self { salt, min_length, alphabet, separators, guards }
+        Self {
+            salt,
+            min_length,
+            alphabet,
+            separators,
+            guards,
+        }
     }
 
     fn index_from_ratio(dividend: usize, divisor: f32) -> usize {
@@ -226,16 +261,20 @@ impl HashIds {
         hashed.into_iter().collect()
     }
 
-    fn unhash<I: Iterator<Item = char>>(hashed: I, alphabet: &[char]) -> u64 {
+    fn unhash<I: Iterator<Item = char>>(hashed: I, alphabet: &[char]) -> Option<u64> {
         let mut number: u64 = 0;
 
         for c in hashed {
-            let pos = alphabet.iter().position(|y| y == &c).unwrap() as u64;
-            number *= alphabet.len() as u64;
-            number += pos;
+            if let Some(pos) = alphabet.iter().position(|y| y == &c) {
+                let pos = pos as u64;
+                number *= alphabet.len() as u64;
+                number += pos;
+            } else {
+                return None;
+            }
         }
 
-        number as u64
+        Some(number as u64)
     }
 
     fn split<I: Iterator<Item = char>>(string: I, splitters: &[char]) -> Vec<Vec<char>> {
@@ -261,8 +300,10 @@ impl HashIds {
 
         let mut alphabet = self.alphabet.clone();
 
-        let vals_hash =
-            vals.iter().enumerate().fold(0, |acc, (i, x)| acc + ((*x as usize) % (i + 100)));
+        let vals_hash = vals
+            .iter()
+            .enumerate()
+            .fold(0, |acc, (i, x)| acc + ((*x as usize) % (i + 100)));
 
         let lottery = self.alphabet[vals_hash % self.alphabet.len()];
         let mut encoded = vec![lottery];
@@ -324,17 +365,24 @@ impl HashIds {
     /// Decode a string into a `Vec` of numbers
     ///
     /// May panic if `hash_str` was not created with the current configuration
-    pub fn decode(&self, hash_str: &str) -> Vec<u64> {
+    pub fn decode(&self, hash_str: &str) -> Result<Vec<u64>, Error> {
         if hash_str.is_empty() {
-            return vec![];
+            return Ok(vec![]);
         }
 
         let mut alphabet = self.alphabet.clone();
 
         let mut parts = Self::split(hash_str.chars(), &self.guards);
 
-        let mut hash_str =
-            if parts.len() >= 2 && parts.len() <= 3 { parts.remove(1) } else { parts.remove(0) };
+        let mut hash_str = if parts.len() >= 2 && parts.len() <= 3 {
+            parts.remove(1)
+        } else {
+            parts.remove(0)
+        };
+
+        if hash_str.is_empty() {
+            return Err(Error::DecodeFailed);
+        }
 
         let lottery = hash_str.remove(0);
 
@@ -350,10 +398,15 @@ impl HashIds {
                 .collect::<Vec<_>>();
             alphabet = Self::reorder(&alphabet, &alphabet_salt);
 
-            out.push(Self::unhash(part.iter().copied(), &alphabet))
+            if let Some(result) = Self::unhash(part.iter().copied(), &alphabet) {
+                out.push(result);
+            } else {
+                return Err(Error::DecodeFailed);
+            }
+            // out.push(Self::unhash(part.iter().copied(), &alphabet))
         }
 
-        out
+        Ok(out)
     }
 }
 
@@ -364,26 +417,32 @@ mod tests {
 
     #[test]
     fn test_small_alphabet_with_no_repeating_characters() {
-        assert!(HashIds::builder().with_alphabet("abcdefghijklmno").finish().is_err());
+        assert!(HashIds::builder()
+            .with_alphabet("abcdefghijklmno")
+            .finish()
+            .is_err());
     }
 
     #[test]
     fn test_small_alphabet_with_repeating_characters() {
-        assert!(HashIds::builder().with_alphabet("abcdecfghijklbmnoa").finish().is_err());
+        assert!(HashIds::builder()
+            .with_alphabet("abcdecfghijklbmnoa")
+            .finish()
+            .is_err());
     }
 
     #[test]
     fn test_empty() {
         let hash_ids = HashIds::builder().finish();
         assert_eq!("", hash_ids.encode(&[]));
-        assert_eq!(Vec::<u64>::new(), hash_ids.decode(""))
+        assert_eq!(Vec::<u64>::new(), hash_ids.decode("").unwrap())
     }
 
     #[test]
     fn test_default_salt() {
         let hash_ids = HashIds::builder().finish();
         assert_eq!("o2fXhV", hash_ids.encode(&[1, 2, 3]));
-        assert_eq!(vec![1, 2, 3], hash_ids.decode("o2fXhV"));
+        assert_eq!(vec![1, 2, 3], hash_ids.decode("o2fXhV").unwrap());
     }
 
     #[test]
@@ -396,11 +455,11 @@ mod tests {
         assert_eq!("Z0E", hash_ids.encode(&[333]));
         assert_eq!("w0rR", hash_ids.encode(&[9999]));
 
-        assert_eq!(vec![12345], hash_ids.decode("j0gW"));
-        assert_eq!(vec![1], hash_ids.decode("jR"));
-        assert_eq!(vec![22], hash_ids.decode("Lw"));
-        assert_eq!(vec![333], hash_ids.decode("Z0E"));
-        assert_eq!(vec![9999], hash_ids.decode("w0rR"));
+        assert_eq!(vec![12345], hash_ids.decode("j0gW").unwrap());
+        assert_eq!(vec![1], hash_ids.decode("jR").unwrap());
+        assert_eq!(vec![22], hash_ids.decode("Lw").unwrap());
+        assert_eq!(vec![333], hash_ids.decode("Z0E").unwrap());
+        assert_eq!(vec![9999], hash_ids.decode("w0rR").unwrap());
     }
 
     #[test]
@@ -412,10 +471,13 @@ mod tests {
         assert_eq!("xGhmsW", hash_ids.encode(&[2, 4, 6]));
         assert_eq!("3lKfD", hash_ids.encode(&[99, 25]));
 
-        assert_eq!(vec![683, 94108, 123, 5], hash_ids.decode("vJvi7On9cXGtD"));
-        assert_eq!(vec![1, 2, 3], hash_ids.decode("o2fXhV"));
-        assert_eq!(vec![2, 4, 6], hash_ids.decode("xGhmsW"));
-        assert_eq!(vec![99, 25], hash_ids.decode("3lKfD"));
+        assert_eq!(
+            vec![683, 94108, 123, 5],
+            hash_ids.decode("vJvi7On9cXGtD").unwrap()
+        );
+        assert_eq!(vec![1, 2, 3], hash_ids.decode("o2fXhV").unwrap());
+        assert_eq!(vec![2, 4, 6], hash_ids.decode("xGhmsW").unwrap());
+        assert_eq!(vec![99, 25], hash_ids.decode("3lKfD").unwrap());
     }
 
     #[test]
@@ -427,10 +489,13 @@ mod tests {
         assert_eq!("LRCgf2", hash_ids.encode(&[2, 4, 6]));
         assert_eq!("JOMh1", hash_ids.encode(&[99, 25]));
 
-        assert_eq!(vec![683, 94108, 123, 5], hash_ids.decode("QWyf8yboH7KT2"));
-        assert_eq!(vec![1, 2, 3], hash_ids.decode("neHrCa"));
-        assert_eq!(vec![2, 4, 6], hash_ids.decode("LRCgf2"));
-        assert_eq!(vec![99, 25], hash_ids.decode("JOMh1"));
+        assert_eq!(
+            vec![683, 94108, 123, 5],
+            hash_ids.decode("QWyf8yboH7KT2").unwrap()
+        );
+        assert_eq!(vec![1, 2, 3], hash_ids.decode("neHrCa").unwrap());
+        assert_eq!(vec![2, 4, 6], hash_ids.decode("LRCgf2").unwrap());
+        assert_eq!(vec![99, 25], hash_ids.decode("JOMh1").unwrap());
     }
 
     #[test]
@@ -442,25 +507,40 @@ mod tests {
         assert_eq!("Z6R>", hash_ids.encode(&[23832]));
         assert_eq!("AYyIB", hash_ids.encode(&[99, 25]));
 
-        assert_eq!(vec![2839, 12, 32, 5], hash_ids.decode("_nJUNTVU3"));
-        assert_eq!(vec![1, 2, 3], hash_ids.decode("7xfYh2"));
-        assert_eq!(vec![23832], hash_ids.decode("Z6R>"));
-        assert_eq!(vec![99, 25], hash_ids.decode("AYyIB"));
+        assert_eq!(vec![2839, 12, 32, 5], hash_ids.decode("_nJUNTVU3").unwrap());
+        assert_eq!(vec![1, 2, 3], hash_ids.decode("7xfYh2").unwrap());
+        assert_eq!(vec![23832], hash_ids.decode("Z6R>").unwrap());
+        assert_eq!(vec![99, 25], hash_ids.decode("AYyIB").unwrap());
     }
 
     #[test]
     fn test_min_length() {
         let hash_ids = HashIds::builder().with_min_length(25).finish();
 
-        assert_eq!("pO3K69b86jzc6krI416enr2B5", hash_ids.encode(&[7452, 2967, 21401]));
+        assert_eq!(
+            "pO3K69b86jzc6krI416enr2B5",
+            hash_ids.encode(&[7452, 2967, 21401])
+        );
         assert_eq!("gyOwl4B97bo2fXhVaDR0Znjrq", hash_ids.encode(&[1, 2, 3]));
         assert_eq!("Nz7x3VXyMYerRmWeOBQn6LlRG", hash_ids.encode(&[6097]));
         assert_eq!("k91nqP3RBe3lKfDaLJrvy8XjV", hash_ids.encode(&[99, 25]));
 
-        assert_eq!(vec![7452, 2967, 21401], hash_ids.decode("pO3K69b86jzc6krI416enr2B5"));
-        assert_eq!(vec![1, 2, 3], hash_ids.decode("gyOwl4B97bo2fXhVaDR0Znjrq"));
-        assert_eq!(vec![6097], hash_ids.decode("Nz7x3VXyMYerRmWeOBQn6LlRG"));
-        assert_eq!(vec![99, 25], hash_ids.decode("k91nqP3RBe3lKfDaLJrvy8XjV"));
+        assert_eq!(
+            vec![7452, 2967, 21401],
+            hash_ids.decode("pO3K69b86jzc6krI416enr2B5").unwrap()
+        );
+        assert_eq!(
+            vec![1, 2, 3],
+            hash_ids.decode("gyOwl4B97bo2fXhVaDR0Znjrq").unwrap()
+        );
+        assert_eq!(
+            vec![6097],
+            hash_ids.decode("Nz7x3VXyMYerRmWeOBQn6LlRG").unwrap()
+        );
+        assert_eq!(
+            vec![99, 25],
+            hash_ids.decode("k91nqP3RBe3lKfDaLJrvy8XjV").unwrap()
+        );
     }
 
     #[test]
@@ -477,10 +557,13 @@ mod tests {
         assert_eq!("jkbgxljrjxmlaonp", hash_ids.encode(&[60125]));
         assert_eq!("erdjpwrgouoxlvbx", hash_ids.encode(&[99, 25]));
 
-        assert_eq!(vec![7452, 2967, 21401], hash_ids.decode("wygqxeunkatjgkrw"));
-        assert_eq!(vec![1, 2, 3], hash_ids.decode("pnovxlaxuriowydb"));
-        assert_eq!(vec![60125], hash_ids.decode("jkbgxljrjxmlaonp"));
-        assert_eq!(vec![99, 25], hash_ids.decode("erdjpwrgouoxlvbx"));
+        assert_eq!(
+            vec![7452, 2967, 21401],
+            hash_ids.decode("wygqxeunkatjgkrw").unwrap()
+        );
+        assert_eq!(vec![1, 2, 3], hash_ids.decode("pnovxlaxuriowydb").unwrap());
+        assert_eq!(vec![60125], hash_ids.decode("jkbgxljrjxmlaonp").unwrap());
+        assert_eq!(vec![99, 25], hash_ids.decode("erdjpwrgouoxlvbx").unwrap());
     }
 
     #[test]
@@ -495,10 +578,13 @@ mod tests {
         assert_eq!("5NMPD", hash_ids.encode(&[60125]));
         assert_eq!("yGya5", hash_ids.encode(&[99, 25]));
 
-        assert_eq!(vec![7452, 2967, 21401], hash_ids.decode("X50Yg6VPoAO4"));
-        assert_eq!(vec![1, 2, 3], hash_ids.decode("GAbDdR"));
-        assert_eq!(vec![60125], hash_ids.decode("5NMPD"));
-        assert_eq!(vec![99, 25], hash_ids.decode("yGya5"));
+        assert_eq!(
+            vec![7452, 2967, 21401],
+            hash_ids.decode("X50Yg6VPoAO4").unwrap()
+        );
+        assert_eq!(vec![1, 2, 3], hash_ids.decode("GAbDdR").unwrap());
+        assert_eq!(vec![60125], hash_ids.decode("5NMPD").unwrap());
+        assert_eq!(vec![99, 25], hash_ids.decode("yGya5").unwrap());
     }
 
     #[test]
@@ -513,10 +599,13 @@ mod tests {
         assert_eq!("38V1D", hash_ids.encode(&[60125]));
         assert_eq!("373az", hash_ids.encode(&[99, 25]));
 
-        assert_eq!(vec![7452, 2967, 21401], hash_ids.decode("GJNNmKYzbPBw"));
-        assert_eq!(vec![1, 2, 3], hash_ids.decode("DQCXa4"));
-        assert_eq!(vec![60125], hash_ids.decode("38V1D"));
-        assert_eq!(vec![99, 25], hash_ids.decode("373az"));
+        assert_eq!(
+            vec![7452, 2967, 21401],
+            hash_ids.decode("GJNNmKYzbPBw").unwrap()
+        );
+        assert_eq!(vec![1, 2, 3], hash_ids.decode("DQCXa4").unwrap());
+        assert_eq!(vec![60125], hash_ids.decode("38V1D").unwrap());
+        assert_eq!(vec![99, 25], hash_ids.decode("373az").unwrap());
     }
 
     #[test]
@@ -526,6 +615,6 @@ mod tests {
         let up_to_100 = (1..=100).into_iter().collect::<Vec<_>>();
 
         assert_eq!("GaHMFdtBf0ceClsgiVIjSrUKh1TyupHXFwt5fQcXCwspilIvSYUQhoT2u0HMF5tVfVc9CEsYiqI6SDUdhyTauBHPaF66t8pfGXcnoC2Vs0ei1YIy8SZ2UPehlyTKZuYJHQyF6wtZafR7c52Cn6skLigpIbGSD7UVkhyZT9xukeHBnFR1tJ2f2ocnVCkVsEQia6IBbSDEUX3hB6TaBuDbHxkFd7tykfrjc55Crjs2GigrIx5SpKUKjhVRTdQuX7H9K", hash_ids.encode(&up_to_100));
-        assert_eq!(up_to_100, hash_ids.decode("GaHMFdtBf0ceClsgiVIjSrUKh1TyupHXFwt5fQcXCwspilIvSYUQhoT2u0HMF5tVfVc9CEsYiqI6SDUdhyTauBHPaF66t8pfGXcnoC2Vs0ei1YIy8SZ2UPehlyTKZuYJHQyF6wtZafR7c52Cn6skLigpIbGSD7UVkhyZT9xukeHBnFR1tJ2f2ocnVCkVsEQia6IBbSDEUX3hB6TaBuDbHxkFd7tykfrjc55Crjs2GigrIx5SpKUKjhVRTdQuX7H9K"));
+        assert_eq!(up_to_100, hash_ids.decode("GaHMFdtBf0ceClsgiVIjSrUKh1TyupHXFwt5fQcXCwspilIvSYUQhoT2u0HMF5tVfVc9CEsYiqI6SDUdhyTauBHPaF66t8pfGXcnoC2Vs0ei1YIy8SZ2UPehlyTKZuYJHQyF6wtZafR7c52Cn6skLigpIbGSD7UVkhyZT9xukeHBnFR1tJ2f2ocnVCkVsEQia6IBbSDEUX3hB6TaBuDbHxkFd7tykfrjc55Crjs2GigrIx5SpKUKjhVRTdQuX7H9K").unwrap());
     }
 }
